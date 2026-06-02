@@ -1,0 +1,33 @@
+# 1. Chặn file nén và dữ liệu thô (nhưng giữ lại cấu trúc thư mục)
+*.zip
+*.tar.gz
+*.csv
+
+# 2. CHỈ chặn định dạng mô hình nặng, KHÔNG chặn toàn bộ thư mục checkpoint
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Bỏ đi các dòng tên thư mục như diffusion-from-scratch/ hay hf_dataset/
+# AI bây giờ sẽ nhìn thấy cấu trúc thư mục và đọc được file config.json!
+
+# 3. Môi trường và Logs (Giữ nguyên như cũ)
+lightning_logs/
+.triton/
+__pycache__/
+.idea/
+.vscode/
+
+# 1. Dữ liệu và Datasets
+*.zip
+*.tar.gz
+*.csv
+
+# Chặn toàn bộ nội dung bên trong thư mục dữ liệu, nhưng không chặn bản thân thư mục
+hf_dataset/**/*
+
+# [NẾU CẦN] Ngoại lệ: Cho phép Git và AI nhìn thấy các file metadata hoặc config trong dataset
+!hf_dataset/*.json
+!hf_dataset/*.yaml
