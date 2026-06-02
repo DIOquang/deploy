@@ -15,9 +15,19 @@ from collections import Counter
 
 # ── 1. Cấu hình đường dẫn ────────────────────────────────────────────────────
 DIFFUSION_MODEL_DIR = "/teamspace/studios/this_studio/diffusion-from-scratch/final_model"
-CGAN_CKPT_PATH      = "/teamspace/studios/this_studio/cgan_checkpoints/last.ckpt"
-CVAE_CKPT_PATH      = os.path.join(os.path.dirname(__file__), "cvae_best.pth")
 METADATA_PATH       = "/teamspace/studios/this_studio/hf_dataset/metadata.jsonl"
+CVAE_CKPT_PATH      = os.path.join(os.path.dirname(__file__), "cvae_best.pth")
+
+# Thử load checkpoint cGAN từ epoch sớm nhất (tránh mode collapse ở epoch 30)
+# Lightning lưu theo format: cgan-epoch=04.ckpt (0-indexed: epoch=04 = training epoch 5)
+CGAN_CKPT_BASE = "/teamspace/studios/this_studio/cgan_checkpoints"
+CGAN_CKPT_PRIORITY = [
+    os.path.join(CGAN_CKPT_BASE, "cgan-epoch=04.ckpt"),   # epoch 5  — tốt nhất
+    os.path.join(CGAN_CKPT_BASE, "cgan-epoch=09.ckpt"),   # epoch 10
+    os.path.join(CGAN_CKPT_BASE, "cgan-epoch=14.ckpt"),   # epoch 15
+    os.path.join(CGAN_CKPT_BASE, "cgan-epoch=19.ckpt"),   # epoch 20
+    os.path.join(CGAN_CKPT_BASE, "last.ckpt"),            # epoch 30 — mode collapse
+]
 
 TEXT_ENC_ID = "openai/clip-vit-large-patch14"
 RESOLUTION  = 128
@@ -144,16 +154,31 @@ except Exception:
     diffusion_error = traceback.format_exc()
     print(f"⚠️  Diffusion load failed.")
 
-# 4b. cGAN (PyTorch Lightning checkpoint)
-cgan_error     = None
-cgan_generator = cgan_tokenizer = cgan_text_enc = None
+# 4b. cGAN — thử từng checkpoint theo thứ tự ưu tiên (tránh mode collapse)
+cgan_error          = None
+cgan_generator      = cgan_tokenizer = cgan_text_enc = None
+cgan_loaded_ckpt    = None
 try:
     from train_cgan import cGANLightning
-    cgan_module    = cGANLightning.load_from_checkpoint(CGAN_CKPT_PATH, map_location=device)
-    cgan_generator = cgan_module.generator.to(device).eval()
-    cgan_tokenizer = cgan_module.tokenizer
-    cgan_text_enc  = cgan_module.text_encoder.to(device).eval()
-    print("✅ cGAN model loaded.")
+    loaded = False
+    errors = []
+    for ckpt_path in CGAN_CKPT_PRIORITY:
+        if not os.path.exists(ckpt_path):
+            errors.append(f"  Not found: {ckpt_path}")
+            continue
+        try:
+            cgan_module    = cGANLightning.load_from_checkpoint(ckpt_path, map_location=device)
+            cgan_generator = cgan_module.generator.to(device).eval()
+            cgan_tokenizer = cgan_module.tokenizer
+            cgan_text_enc  = cgan_module.text_encoder.to(device).eval()
+            cgan_loaded_ckpt = os.path.basename(ckpt_path)
+            print(f"✅ cGAN loaded from: {cgan_loaded_ckpt}")
+            loaded = True
+            break
+        except Exception as e:
+            errors.append(f"  Failed {ckpt_path}: {e}")
+    if not loaded:
+        raise RuntimeError("Không tìm thấy checkpoint cGAN nào.\n" + "\n".join(errors))
 except Exception:
     cgan_error = traceback.format_exc()
     print(f"⚠️  cGAN load failed.")
@@ -320,7 +345,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as demo:
                                    elem_classes="time-badge")
 
         with gr.Column(elem_classes="model-col"):
-            gr.Markdown("### ⚡ cGAN")
+            cgan_ckpt_name = cgan_loaded_ckpt or "Không load được"
+            gr.Markdown(f"### ⚡ cGAN\n`checkpoint: {cgan_ckpt_name}`")
             cgan_img  = gr.Image(label="Kết quả", type="pil", interactive=False, height=256)
             cgan_time = gr.Textbox(label="⏱️ Thời gian sinh", interactive=False,
                                    elem_classes="time-badge")
@@ -354,7 +380,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as demo:
     ---
     **Ghi chú:**
     - **Diffusion** dùng CLIP + UNet tùy chỉnh — chậm hơn (nhiều bước denoising).
-    - **cGAN** dùng DistilBERT — sinh ảnh nhanh (1 forward pass).
+    - **cGAN** dùng DistilBERT — sinh ảnh nhanh (1 forward pass). ⚠️ GAN hay bị *mode collapse* ở epoch muộn, app tự ưu tiên checkpoint epoch sớm (5→10).
     - **cVAE** dùng Embedding đơn giản (vocab từ dataset) — sinh ảnh nhanh nhất.
     """)
 
