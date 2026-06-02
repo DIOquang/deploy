@@ -2,332 +2,191 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import json
-import math
+import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as transforms
+from torchvision import transforms
 from torchvision.utils import save_image
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, Callback
-from pytorch_lightning.loggers import CSVLogger
 from PIL import Image
-from transformers import AutoTokenizer, AutoModel
+from collections import Counter
+from tqdm import tqdm
 
 # ==============================================================================
-# 1. Dataset & DataLoader
+# 1. Cấu hình
 # ==============================================================================
-class TextImageDataset(Dataset):
-    def __init__(self, metadata_path, image_dir, transform=None):
-        self.image_dir = image_dir
+BASE_PATH   = "/teamspace/studios/this_studio/hf_dataset"
+IMAGE_DIR   = os.path.join(BASE_PATH, "images")
+METADATA_PATH = os.path.join(BASE_PATH, "metadata.jsonl")
+OUTPUT_DIR  = "/teamspace/studios/this_studio/cvae_results"
+
+LATENT_DIM  = 128
+COND_DIM    = 128
+MAX_SEQ_LEN = 15
+BATCH_SIZE  = 64
+EPOCHS      = 60
+LR          = 1e-3
+BETA        = 0.5          # KL weight
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+
+# ==============================================================================
+# 2. Đọc metadata & xây Vocabulary
+# ==============================================================================
+data_records = []
+all_words    = []
+
+with open(METADATA_PATH, "r", encoding="utf-8") as f:
+    for line in f:
+        item = json.loads(line)
+        img_name = os.path.basename(item.get("file_name", ""))
+        prompt   = item.get("text", "").lower()
+        words    = re.findall(r"\b\w+\b", prompt)
+        all_words.extend(words)
+        data_records.append({
+            "img_path": os.path.join(IMAGE_DIR, img_name),
+            "prompt":   prompt,
+            "words":    words,
+        })
+
+word_counts = Counter(all_words)
+vocab       = {word: i + 1 for i, (word, _) in enumerate(word_counts.items())}  # 0 = padding
+VOCAB_SIZE  = len(vocab) + 1
+print(f"Vocabulary size: {VOCAB_SIZE}  |  Dataset size: {len(data_records)}")
+
+
+# ==============================================================================
+# 3. Dataset
+# ==============================================================================
+class GameIconDataset(Dataset):
+    def __init__(self, records, vocab, transform=None):
+        self.records   = records
+        self.vocab     = vocab
         self.transform = transform
-        self.data = []
-        with open(metadata_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                self.data.append(json.loads(line.strip()))
 
     def __len__(self):
-        return len(self.data)
+        return len(self.records)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
-        img_name = os.path.basename(item['file_name'])
-        img_path = os.path.join(self.image_dir, img_name)
-
-        image = Image.open(img_path).convert('RGB')
+        record = self.records[idx]
+        img    = Image.open(record["img_path"]).convert("RGB")
         if self.transform:
-            image = self.transform(image)
+            img = self.transform(img)
 
-        text_prompt = item.get('text', '')
-        return image, text_prompt
+        tokens  = [self.vocab.get(w, 0) for w in record["words"]][:MAX_SEQ_LEN]
+        tokens += [0] * (MAX_SEQ_LEN - len(tokens))
+        return img, torch.tensor(tokens, dtype=torch.long)
 
 
-def get_dataloader(metadata_path, image_dir, batch_size=32):
-    transform = transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-    ])
-    dataset = TextImageDataset(metadata_path, image_dir, transform)
-    dataloader = DataLoader(
-        dataset, batch_size=batch_size, shuffle=True,
-        num_workers=4, drop_last=True, pin_memory=True
-    )
-    return dataloader
+transform = transforms.Compose([
+    transforms.Resize((128, 128)),
+    transforms.ToTensor(),          # scale [0, 1]
+])
+
+dataset    = GameIconDataset(data_records, vocab, transform)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
 
 
 # ==============================================================================
-# 2. cVAE Architecture
+# 4. Kiến trúc cVAE (khớp với cvae_best.pth)
 # ==============================================================================
-LATENT_DIM    = 256
-TEXT_EMBED_DIM = 768  # DistilBERT hidden size
-
-
-class ResBlock(nn.Module):
-    """Residual block với GroupNorm để training ổn định hơn."""
-    def __init__(self, channels):
+class TextEncoder(nn.Module):
+    """Embedding đơn giản → mean pooling."""
+    def __init__(self, vocab_size, embed_dim=COND_DIM):
         super().__init__()
-        self.block = nn.Sequential(
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-            nn.GroupNorm(8, channels),
-            nn.SiLU(),
-            nn.Conv2d(channels, channels, 3, padding=1),
-        )
+        self.embedding = nn.Embedding(vocab_size, embed_dim)
 
     def forward(self, x):
-        return x + self.block(x)
+        embedded = self.embedding(x)       # (B, seq_len, embed_dim)
+        return embedded.mean(dim=1)        # (B, embed_dim)
 
 
-class Encoder(nn.Module):
-    """
-    Encoder: ảnh 3×128×128 + text_embed → μ và log_σ² (dim=LATENT_DIM)
-    Kiến trúc: Conv2D downsampling + text projection được inject vào latent
-    """
-    def __init__(self, latent_dim=LATENT_DIM, text_embed_dim=TEXT_EMBED_DIM):
+class cVAE(nn.Module):
+    def __init__(self, vocab_size, latent_dim=LATENT_DIM, cond_dim=COND_DIM):
         super().__init__()
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_embed_dim, 256),
-            nn.SiLU(),
+        self.latent_dim = latent_dim
+
+        # Text encoder
+        self.text_encoder = TextEncoder(vocab_size, cond_dim)
+
+        # Encoder: 3×128×128 → 256×8×8
+        self.enc_conv = nn.Sequential(
+            nn.Conv2d(3,   32,  4, 2, 1), nn.ReLU(),   # 64×64
+            nn.Conv2d(32,  64,  4, 2, 1), nn.ReLU(),   # 32×32
+            nn.Conv2d(64,  128, 4, 2, 1), nn.ReLU(),   # 16×16
+            nn.Conv2d(128, 256, 4, 2, 1), nn.ReLU(),   #  8×8
+        )
+        self.flatten_size = 256 * 8 * 8   # 16 384
+
+        self.fc_mu     = nn.Linear(self.flatten_size + cond_dim, latent_dim)
+        self.fc_logvar = nn.Linear(self.flatten_size + cond_dim, latent_dim)
+
+        # Decoder: (z + cond) → 3×128×128
+        self.fc_dec = nn.Linear(latent_dim + cond_dim, self.flatten_size)
+        self.dec_conv = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.ReLU(),      # 16×16
+            nn.ConvTranspose2d(128,  64, 4, 2, 1), nn.ReLU(),      # 32×32
+            nn.ConvTranspose2d( 64,  32, 4, 2, 1), nn.ReLU(),      # 64×64
+            nn.ConvTranspose2d( 32,   3, 4, 2, 1), nn.Sigmoid(),   # 128×128
         )
 
-        # Downsampling: 128 → 64 → 32 → 16 → 8
-        self.enc = nn.Sequential(
-            nn.Conv2d(3, 64, 3, stride=2, padding=1),      # 64×64
-            nn.SiLU(),
-            ResBlock(64),
-
-            nn.Conv2d(64, 128, 3, stride=2, padding=1),    # 32×32
-            nn.SiLU(),
-            ResBlock(128),
-
-            nn.Conv2d(128, 256, 3, stride=2, padding=1),   # 16×16
-            nn.SiLU(),
-            ResBlock(256),
-
-            nn.Conv2d(256, 512, 3, stride=2, padding=1),   # 8×8
-            nn.SiLU(),
-            ResBlock(512),
-        )
-
-        # Flatten 512×8×8 = 32768, concat với text_proj (256) → fc
-        flat_dim = 512 * 8 * 8 + 256
-        self.fc_mu     = nn.Linear(flat_dim, latent_dim)
-        self.fc_logvar = nn.Linear(flat_dim, latent_dim)
-
-    def forward(self, img, text_embed):
-        feat = self.enc(img)
-        feat = feat.flatten(1)
-        text_feat = self.text_proj(text_embed)
-        combined = torch.cat([feat, text_feat], dim=1)
-        mu     = self.fc_mu(combined)
-        logvar = self.fc_logvar(combined)
-        return mu, logvar
-
-
-class Decoder(nn.Module):
-    """
-    Decoder: z (LATENT_DIM) + text_embed → ảnh 3×128×128
-    Kiến trúc: Linear projection → reshape → ConvTranspose2D upsampling
-    """
-    def __init__(self, latent_dim=LATENT_DIM, text_embed_dim=TEXT_EMBED_DIM):
-        super().__init__()
-        self.text_proj = nn.Sequential(
-            nn.Linear(text_embed_dim, 256),
-            nn.SiLU(),
-        )
-
-        # Kết hợp z + text → project lên spatial feature map
-        self.fc = nn.Linear(latent_dim + 256, 512 * 8 * 8)
-
-        # Upsampling: 8 → 16 → 32 → 64 → 128
-        self.dec = nn.Sequential(
-            ResBlock(512),
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1),  # 16×16
-            nn.SiLU(),
-            ResBlock(256),
-
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1),  # 32×32
-            nn.SiLU(),
-            ResBlock(128),
-
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),   # 64×64
-            nn.SiLU(),
-            ResBlock(64),
-
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1),    # 128×128
-            nn.SiLU(),
-            nn.Conv2d(32, 3, 3, padding=1),
-            nn.Tanh(),
-        )
-
-    def forward(self, z, text_embed):
-        text_feat = self.text_proj(text_embed)
-        combined  = torch.cat([z, text_feat], dim=1)
-        out = self.fc(combined)
-        out = out.view(-1, 512, 8, 8)
-        img = self.dec(out)
-        return img
-
-
-# ==============================================================================
-# 3. Lightning Module
-# ==============================================================================
-class cVAELightning(pl.LightningModule):
-    """
-    Conditional VAE Lightning Module.
-
-    Loss = Reconstruction (MSE) + β × KL Divergence
-    β tăng dần từ 0 → 1 trong 5 epoch đầu (β-annealing)
-    để tránh posterior collapse.
-    """
-    def __init__(
-        self,
-        latent_dim: int = LATENT_DIM,
-        lr: float = 1e-4,
-        beta_max: float = 1.0,
-        warmup_epochs: int = 5,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.encoder = Encoder(latent_dim)
-        self.decoder = Decoder(latent_dim)
-
-        # Frozen text encoder (DistilBERT)
-        self.tokenizer    = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-        self.text_encoder = AutoModel.from_pretrained("distilbert-base-uncased")
-        self.text_encoder.eval()
-        for p in self.text_encoder.parameters():
-            p.requires_grad = False
-
-    # ── Text Encoding ─────────────────────────────────────────────────────────
-    def get_text_embeddings(self, texts):
-        inputs = self.tokenizer(
-            texts, padding=True, truncation=True,
-            return_tensors="pt", max_length=77
-        ).to(self.device)
-        with torch.no_grad():
-            out = self.text_encoder(**inputs)
-        return out.last_hidden_state[:, 0, :]  # [CLS] token
-
-    # ── Reparameterization Trick ──────────────────────────────────────────────
     def reparameterize(self, mu, logvar):
-        if self.training:
-            std = torch.exp(0.5 * logvar)
-            eps = torch.randn_like(std)
-            return mu + eps * std
-        return mu  # Deterministic during inference
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
 
-    # ── Forward ───────────────────────────────────────────────────────────────
-    def forward(self, img, text_embed):
-        mu, logvar = self.encoder(img, text_embed)
-        z          = self.reparameterize(mu, logvar)
-        recon      = self.decoder(z, text_embed)
-        return recon, mu, logvar
+    def forward(self, x, c_text):
+        c_vec   = self.text_encoder(c_text)          # (B, cond_dim)
+        x_enc   = self.enc_conv(x)
+        x_flat  = x_enc.view(x_enc.size(0), -1)
+        enc_in  = torch.cat([x_flat, c_vec], dim=1)
+        mu      = self.fc_mu(enc_in)
+        logvar  = self.fc_logvar(enc_in)
+        z       = self.reparameterize(mu, logvar)
+        dec_in  = torch.cat([z, c_vec], dim=1)
+        x_dec   = self.fc_dec(dec_in).view(-1, 256, 8, 8)
+        out     = self.dec_conv(x_dec)
+        return out, mu, logvar
 
-    # ── Inference (text-only, sample từ prior) ────────────────────────────────
     @torch.no_grad()
-    def generate(self, texts):
-        text_embed = self.get_text_embeddings(texts)
-        z = torch.randn(len(texts), self.hparams.latent_dim, device=self.device)
-        imgs = self.decoder(z, text_embed)
-        imgs = imgs * 0.5 + 0.5  # [-1,1] → [0,1]
-        return imgs
-
-    # ── Training Step ─────────────────────────────────────────────────────────
-    def training_step(self, batch, batch_idx):
-        imgs, texts = batch
-        text_embeds = self.get_text_embeddings(texts)
-
-        recon, mu, logvar = self(imgs, text_embeds)
-
-        # Reconstruction loss (MSE trên ảnh đã normalize [-1,1])
-        recon_loss = F.mse_loss(recon, imgs, reduction='mean')
-
-        # KL Divergence: -0.5 * sum(1 + logvar - μ² - e^logvar)
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
-        # β-annealing: tăng dần β trong warmup_epochs đầu
-        current_epoch = self.current_epoch
-        beta = min(
-            self.hparams.beta_max,
-            self.hparams.beta_max * current_epoch / max(1, self.hparams.warmup_epochs)
-        )
-
-        loss = recon_loss + beta * kl_loss
-
-        self.log('train_loss',  loss,       prog_bar=True,  on_step=True, on_epoch=True)
-        self.log('recon_loss',  recon_loss, prog_bar=False, on_step=False, on_epoch=True)
-        self.log('kl_loss',     kl_loss,    prog_bar=False, on_step=False, on_epoch=True)
-        self.log('beta',        beta,       prog_bar=True,  on_step=False, on_epoch=True)
-        return loss
-
-    # ── Optimizer ─────────────────────────────────────────────────────────────
-    def configure_optimizers(self):
-        params = list(self.encoder.parameters()) + list(self.decoder.parameters())
-        opt = torch.optim.AdamW(params, lr=self.hparams.lr, weight_decay=1e-5)
-
-        # Cosine Annealing LR
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=30, eta_min=1e-6
-        )
-        return [opt], [scheduler]
+    def generate(self, tokens_tensor):
+        """Sinh ảnh từ token tensor (B, MAX_SEQ_LEN)."""
+        self.eval()
+        c_vec   = self.text_encoder(tokens_tensor)
+        z       = torch.randn(tokens_tensor.size(0), self.latent_dim, device=tokens_tensor.device)
+        dec_in  = torch.cat([z, c_vec], dim=1)
+        x_dec   = self.fc_dec(dec_in).view(-1, 256, 8, 8)
+        return self.dec_conv(x_dec)
 
 
 # ==============================================================================
-# 4. Callback sinh ảnh Validation
+# 5. Loss Function
 # ==============================================================================
-class cVAEGenerateCallback(Callback):
-    def __init__(self, prompts, output_dir="cvae_val_results", every_n_epochs=5):
-        super().__init__()
-        self.prompts     = prompts
-        self.output_dir  = output_dir
-        self.every_n_epochs = every_n_epochs
-        os.makedirs(output_dir, exist_ok=True)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch + 1
-        if epoch % self.every_n_epochs == 0:
-            print(f"\n[Epoch {epoch}] Sinh ảnh validation cVAE...")
-            imgs = pl_module.generate(self.prompts)
-            for i, (img_tensor, prompt) in enumerate(zip(imgs, self.prompts)):
-                fname = f"cvae_val_epoch_{epoch:02d}_prompt_{i}.png"
-                save_image(img_tensor, os.path.join(self.output_dir, fname))
-                print(f"  ✔ Saved: {fname}  \"{prompt}\"")
+def cvae_loss_fn(recon_x, x, mu, logvar, beta=BETA):
+    recon_loss = F.binary_cross_entropy(recon_x, x, reduction="sum")
+    kl_loss    = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return recon_loss + beta * kl_loss
 
 
 # ==============================================================================
-# 5. Hàm sinh ảnh sau khi train xong
+# 6. Helper: tokenize prompt thành tensor
 # ==============================================================================
-def generate_images_post_train(model, output_dir="cvae_results", n=500):
-    os.makedirs(output_dir, exist_ok=True)
-    model.eval()
-    sample_prompts = [
-        "a diamond sword, game icon, glowing cyan aura",
-        "a gold potion, game icon, radiant yellow aura",
-        "a wood spellbook, game icon, warm brown",
-        "a copper axe, game icon, orange-brown copper",
-    ]
-    print(f"\nBắt đầu sinh {n} ảnh tại {output_dir}...")
-    for i in range(n):
-        prompt = sample_prompts[i % len(sample_prompts)]
-        imgs = model.generate([prompt])
-        save_image(imgs[0], os.path.join(output_dir, f"cvae_gen_{i:04d}.png"))
-    print(f"✅ Hoàn thành sinh {n} ảnh cVAE!")
+def tokenize(prompt, vocab, max_len=MAX_SEQ_LEN):
+    words  = re.findall(r"\b\w+\b", prompt.lower())
+    tokens = [vocab.get(w, 0) for w in words][:max_len]
+    tokens += [0] * (max_len - len(tokens))
+    return tokens
 
 
 # ==============================================================================
-# MAIN
+# 7. Training
 # ==============================================================================
-if __name__ == '__main__':
-    METADATA_PATH = "/teamspace/studios/this_studio/hf_dataset/metadata.jsonl"
-    IMAGE_DIR     = "/teamspace/studios/this_studio/hf_dataset/images"
-    CVAE_CKPT_DIR = "/teamspace/studios/this_studio/cvae_checkpoints"
-    CVAE_RESULT   = "/teamspace/studios/this_studio/cvae_results"
-
+if __name__ == "__main__":
     VAL_PROMPTS = [
         "a diamond sword, game icon, glowing cyan aura",
         "a gold potion, game icon, radiant yellow aura",
@@ -335,47 +194,52 @@ if __name__ == '__main__':
         "a copper axe, game icon, orange-brown copper",
     ]
 
-    dataloader = get_dataloader(METADATA_PATH, IMAGE_DIR, batch_size=32)
-    model = cVAELightning(latent_dim=LATENT_DIM, lr=1e-4, beta_max=1.0, warmup_epochs=5)
+    model     = cVAE(vocab_size=VOCAB_SIZE).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LR)
 
-    # Callbacks
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=CVAE_CKPT_DIR,
-        filename="cvae-{epoch:02d}-{train_loss:.4f}",
-        every_n_epochs=5,
-        save_top_k=-1,
-        save_last=True,
-    )
-    image_cb = cVAEGenerateCallback(
-        prompts=VAL_PROMPTS,
-        output_dir="./cvae_val_results",
-        every_n_epochs=5,
-    )
-    csv_logger = CSVLogger(save_dir="./", name="cvae_training_logs")
-
-    trainer = pl.Trainer(
-        max_epochs=30,
-        accelerator="auto",
-        devices=1,
-        precision="16-mixed",     # fp16 mixed precision
-        callbacks=[checkpoint_cb, image_cb],
-        logger=csv_logger,
-        log_every_n_steps=10,
-    )
+    best_loss  = float("inf")
+    best_path  = os.path.join(OUTPUT_DIR, "cvae_best.pth")
+    val_dir    = os.path.join(OUTPUT_DIR, "val_images")
+    os.makedirs(val_dir, exist_ok=True)
 
     print("Bắt đầu Training cVAE...")
-    trainer.fit(model, dataloader)
+    for epoch in range(EPOCHS):
+        model.train()
+        total_loss = 0.0
 
-    print("\nTraining hoàn tất! Lưu final model...")
-    # Lưu final checkpoint
-    final_ckpt = os.path.join(CVAE_CKPT_DIR, "final.ckpt")
-    trainer.save_checkpoint(final_ckpt)
-    print(f"✅ Final checkpoint lưu tại: {final_ckpt}")
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        for images, text_tokens in pbar:
+            images      = images.to(device)
+            text_tokens = text_tokens.to(device)
 
-    # Sinh ảnh test
-    best_path = trainer.checkpoint_callback.last_model_path
-    if best_path and os.path.exists(best_path):
-        model = cVAELightning.load_from_checkpoint(best_path)
+            optimizer.zero_grad()
+            recon, mu, logvar = model(images, text_tokens)
+            loss = cvae_loss_fn(recon, images, mu, logvar)
+            loss.backward()
+            optimizer.step()
 
-    model.to("cuda" if torch.cuda.is_available() else "cpu")
-    generate_images_post_train(model, output_dir=CVAE_RESULT, n=500)
+            total_loss += loss.item()
+            pbar.set_postfix(loss=f"{loss.item()/len(images):.4f}")
+
+        avg_loss = total_loss / len(dataloader)
+        print(f"→ Epoch [{epoch+1}/{EPOCHS}] | Avg Loss: {avg_loss:.4f}")
+
+        # Lưu best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save(model.state_dict(), best_path)
+            print(f"  ✅ Saved best model (loss={best_loss:.4f})")
+
+        # Validation mỗi 5 epoch
+        if (epoch + 1) % 5 == 0:
+            model.eval()
+            print(f"  [Val] Sinh ảnh tại Epoch {epoch+1}...")
+            for i, prompt in enumerate(VAL_PROMPTS):
+                tokens = tokenize(prompt, vocab)
+                t      = torch.tensor([tokens], dtype=torch.long, device=device)
+                img    = model.generate(t)
+                fname  = os.path.join(val_dir, f"val_epoch{epoch+1:02d}_p{i}.png")
+                save_image(img, fname)
+            model.train()
+
+    print(f"\n✅ Training hoàn tất! Best model: {best_path}")
