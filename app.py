@@ -305,8 +305,52 @@ def generate_all(prompt, num_steps, guidance_scale, seed):
 
 # ── 8. Giao diện Gradio ───────────────────────────────────────────────────────
 css = """
-.model-col { border: 1px solid #2d2d2d; border-radius: 12px; padding: 12px; background: #1a1a2e; }
-.time-badge textarea { text-align: center; font-size: 1.1em; font-weight: bold; color: #00d4ff; }
+/* Nền tối cho mỗi cột model */
+.model-col {
+    border: 1px solid #3a3a5c;
+    border-radius: 12px;
+    padding: 14px;
+    background: #1a1a2e;
+}
+
+/* Toàn bộ text trong cột model phải trắng/sáng */
+.model-col * { color: #e8e8f0 !important; }
+
+/* Tiêu đề mỗi cột (h3) */
+.model-col .prose h3 {
+    color: #ffffff !important;
+    font-size: 1.1em !important;
+    font-weight: 700 !important;
+    margin-bottom: 8px !important;
+    padding-bottom: 6px !important;
+    border-bottom: 2px solid #3a3a5c;
+}
+
+/* Label của Image và Textbox bên trong cột */
+.model-col label span,
+.model-col .label-wrap span {
+    color: #a0a8c0 !important;
+    font-size: 0.85em !important;
+}
+
+/* Thời gian sinh ảnh */
+.time-badge textarea {
+    text-align: center !important;
+    font-size: 1.05em !important;
+    font-weight: bold !important;
+    color: #00d4ff !important;
+    background: #0d0d1f !important;
+    border: 1px solid #2a2a4a !important;
+}
+
+/* Code block cho checkpoint name */
+.model-col code {
+    background: #0d0d22 !important;
+    color: #7ec8e3 !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+    font-size: 0.78em !important;
+}
 """
 
 with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as demo:
